@@ -177,6 +177,7 @@ job *createJob(char *id, int state, int ttl) {
 
     j->queue = NULL;
     j->state = state;
+    j->gc_retry = 0;
     j->flags = 0;
     j->body = NULL;
     j->nodes_delivered = dictCreate(&clusterNodesDictType,NULL);
@@ -278,6 +279,16 @@ char *jobStateToString(int state) {
     char *states[] = {"wait-repl","active","queued","acked"};
     if (state < 0 || state > JOB_STATE_ACKED) return "unknown";
     return states[state];
+}
+
+/* Return the state number for the specified C string, or -1 if
+ * there is no match. */
+int jobStateFromString(char *state) {
+    if (!strcasecmp(state,"wait-repl")) return JOB_STATE_WAIT_REPL;
+    else if (!strcasecmp(state,"active")) return JOB_STATE_ACTIVE;
+    else if (!strcasecmp(state,"queued")) return JOB_STATE_QUEUED;
+    else if (!strcasecmp(state,"acked")) return JOB_STATE_ACKED;
+    else return -1;
 }
 
 /* ----------------------------- Awakeme list ------------------------------
@@ -598,7 +609,7 @@ sds serializeJob(sds jobs, job *j, int sertype) {
     p = msg + 4 + JOB_STRUCT_SER_LEN;
 
     /* Queue name is 4 bytes prefixed len in little endian + actual bytes. */
-    p = serializeSdsString(p,j->queue->ptr);
+    p = serializeSdsString(p,j->queue ? j->queue->ptr : NULL);
 
     /* Body is 4 bytes prefixed len in little endian + actual bytes. */
     p = serializeSdsString(p,j->body);
@@ -892,6 +903,9 @@ void unblockClientWaitingJobRepl(client *c) {
      * waiting it gets freed or reaches the timeout, we unblock the client and
      * forget about the job. */
     if (c->bpop.job->state == JOB_STATE_WAIT_REPL) {
+        /* Set the job as active before calling deleteJobFromCluster() since
+         * otherwise unregistering the job will, in turn, unblock the client,
+         * which we are already doing here. */
         c->bpop.job->state = JOB_STATE_ACTIVE;
         deleteJobFromCluster(c->bpop.job);
     }
@@ -914,9 +928,15 @@ void addReplyJobID(client *c, job *j) {
  * unblocked if this function is called, since if the blocked client is
  * released, the job is deleted (and a best effort try is made to remove
  * copies from other nodes), to avoid non acknowledged jobs to be active
- * when possible. */
-void jobReplicationAchieved(job *j) {
-    serverLog(DISQUE_VERBOSE,"Replication ACHIEVED");
+ * when possible.
+ *
+ * Return value: if the job is retained after the function is called
+ * (normal replication) then DISQUE_OK is returned. Otherwise if the
+ * function removes the job from the node, since the job is externally
+ * replicated, DISQUE_ERR is returned, in order to signal the client further
+ * accesses to the job are not allowed. */
+int jobReplicationAchieved(job *j) {
+    serverLog(DISQUE_VERBOSE,"Replication ACHIEVED %.48s",j->id);
 
     /* Change the job state to active. This is critical to avoid the job
      * will be freed by unblockClient() if found still in the old state. */
@@ -946,7 +966,7 @@ void jobReplicationAchieved(job *j) {
         }
         unregisterJob(j);
         freeJob(j);
-        return;
+        return DISQUE_ERR;
     }
 
     /* Queue the job locally. */
@@ -956,6 +976,7 @@ void jobReplicationAchieved(job *j) {
         updateJobAwakeTime(j,0); /* Queue with delay. */
 
     AOFLoadJob(j);
+    return DISQUE_OK;
 }
 
 /* This function is called periodically by clientsCron(). Its goal is to
@@ -1113,6 +1134,12 @@ void addjobCommand(client *c) {
         return;
     }
 
+    /* Are we going to discard the local copy before to return to the caller?
+     * This happens when the job is at the same type asynchronously
+     * replicated AND because of memory warning level we are going to
+     * replicate externally without taking a copy. */
+    int discard_local_copy = async && extrepl;
+
     /* Create a new job. */
     job *job = createJob(NULL,JOB_STATE_WAIT_REPL,ttl);
     job->queue = c->argv[1];
@@ -1148,10 +1175,8 @@ void addjobCommand(client *c) {
         job->qtime = server.mstime + retry*1000;
     }
 
-    /* Register the job locally in all the cases but when the job
-     * is externally replicated and asynchronous replicated at the same
-     * time: in this case we don't want to take a local copy at all. */
-    if (!(async && extrepl) && registerJob(job) == DISQUE_ERR) {
+    /* Register the job locally, unless we are going to remove it locally. */
+    if (!discard_local_copy && registerJob(job) == DISQUE_ERR) {
         /* A job ID with the same name? Practically impossible but
          * let's handle it to trap possible bugs in a cleaner way. */
         serverLog(DISQUE_WARNING,"ID already existing in ADDJOB command!");
@@ -1188,10 +1213,10 @@ void addjobCommand(client *c) {
              * forward to ACTIVE state ASAP, and get scheduled for
              * queueing. */
             job->state = JOB_STATE_ACTIVE;
-            updateJobAwakeTime(job,0);
+            if (!discard_local_copy) updateJobAwakeTime(job,0);
         }
         addReplyJobID(c,job);
-        AOFLoadJob(job);
+        if (!extrepl) AOFLoadJob(job);
     }
 
     /* If the replication factor is > 1, send REPLJOB messages to REPLICATE-1
@@ -1202,7 +1227,7 @@ void addjobCommand(client *c) {
     /* If the job is asynchronously and externally replicated at the same time,
      * send a QUEUE message ASAP to one random node, and delete the job from
      * this node right now. */
-    if (async && extrepl) {
+    if (discard_local_copy) {
         dictEntry *de = dictGetRandomKey(job->nodes_delivered);
         if (de) {
             clusterNode *n = dictGetVal(de);
@@ -1214,17 +1239,8 @@ void addjobCommand(client *c) {
     }
 }
 
-/* SHOW <job-id> */
-void showCommand(client *c) {
-    if (validateJobIdOrReply(c,c->argv[1]->ptr,sdslen(c->argv[1]->ptr))
-        == DISQUE_ERR) return;
-
-    job *j = lookupJob(c->argv[1]->ptr);
-    if (!j) {
-        addReply(c,shared.nullbulk);
-        return;
-    }
-
+/* Client reply function for SHOW and JSCAN. */
+void addReplyJobInfo(client *c, job *j) {
     addReplyMultiBulkLen(c,26);
 
     addReplyBulkCString(c,"id");
@@ -1299,6 +1315,19 @@ void showCommand(client *c) {
         addReply(c,shared.nullbulk);
 }
 
+/* SHOW <job-id> */
+void showCommand(client *c) {
+    if (validateJobIdOrReply(c,c->argv[1]->ptr,sdslen(c->argv[1]->ptr))
+        == DISQUE_ERR) return;
+
+    job *j = lookupJob(c->argv[1]->ptr);
+    if (!j) {
+        addReply(c,shared.nullbulk);
+        return;
+    }
+    addReplyJobInfo(c,j);
+}
+
 /* DELJOB jobid_1 jobid_2 ... jobid_N
  *
  * Evict (and possibly remove from queue) all the jobs in memeory
@@ -1316,11 +1345,154 @@ void deljobCommand(client *c) {
     /* Perform the appropriate action for each job. */
     for (j = 1; j < c->argc; j++) {
         job *job = lookupJob(c->argv[j]->ptr);
-        if (job == NULL) return;
+        if (job == NULL) continue;
         unregisterJob(job);
         freeJob(job);
         evicted++;
     }
     addReplyLongLong(c,evicted);
+}
+
+/* JSCAN [<cursor>] [COUNT <count>] [BLOCKING] [QUEUE <queue>]
+ * [STATE <state1> STATE <state2> ... STATE <stateN>]
+ * [REPLY all|id]
+ *
+ * The command provides an interface to iterate all the existing jobs in
+ * the local node, providing a cursor in the form of an integer that is passed
+ * to the next command invocation. During the first call cursor must be 0,
+ * in the next calls the cursor returned in the previous call is used in the
+ * next. The iterator guarantees to return all the elements but may return
+ * duplicated elements.
+ *
+ * Options:
+ *
+ * COUNT <count>     -- An hit about how much work to do per iteration.
+ * BUSYLOOP          -- Block and return all the elements in a busy loop.
+ * QUEUE <queue>     -- Return only jobs in the specified queue.
+ * STATE <state>     -- Return jobs in the specified state.
+ *                      Can be used multiple times for a logic OR.
+ * REPLY <type>      -- Job reply type. Default is to report just the job
+ *                      ID. If "all" is specified the full job state is
+ *                      returned like for the SHOW command.
+ *
+ * The cursor argument can be in any place, the first non matching option
+ * that has valid cursor form of an usigned number will be sensed as a valid
+ * cursor.
+ */
+
+/* JSCAN reply type. */
+#define JSCAN_REPLY_ID 0        /* Just report the Job ID. */
+#define JSCAN_REPLY_ALL 1       /* Reply full job info like SHOW. */
+
+/* The structure to pass the filter options to the callback. */
+struct jscanFilter {
+    int state[16];  /* Every state to return is set to non-zero. */
+    int numstates;  /* Number of states non-true. 0 = match all. */
+    robj *queue;    /* Queue name or NULL to return any queue. */
+};
+
+/* Callback for the dictionary scan used by JSCAN. */
+void jscanCallback(void *privdata, const dictEntry *de) {
+    void **pd = (void**)privdata;
+    list *list = pd[0];
+    struct jscanFilter *filter = pd[1];
+    job *job = dictGetKey(de);
+
+    /* Don't add the item if it does not satisfies our filter. */
+    if (filter->queue && !equalStringObjects(job->queue,filter->queue)) return;
+    if (filter->numstates && !filter->state[job->state]) return;
+
+    /* Otherwise put the queue into the list that will be returned to the
+     * client later. */
+    listAddNodeTail(list,job);
+}
+
+#define JSCAN_DEFAULT_COUNT 100
+void jscanCommand(client *c) {
+    struct jscanFilter filter;
+    int busyloop = 0; /* If true return all the jobs in a blocking way. */
+    long count = JSCAN_DEFAULT_COUNT;
+    long maxiterations;
+    unsigned long cursor = 0;
+    int cursor_set = 0, j;
+    int reply_type = JSCAN_REPLY_ID;
+
+    memset(&filter,0,sizeof(filter));
+
+    /* Parse arguments and cursor if any. */
+    for (j = 1; j < c->argc; j++) {
+        int remaining = c->argc - j -1;
+        char *opt = c->argv[j]->ptr;
+
+        if (!strcasecmp(opt,"count") && remaining) {
+            if (getLongFromObjectOrReply(c, c->argv[j+1], &count, NULL) !=
+                DISQUE_OK) return;
+            j++;
+        } else if (!strcasecmp(opt,"busyloop")) {
+            busyloop = 1;
+        } else if (!strcasecmp(opt,"queue") && remaining) {
+            filter.queue = c->argv[j+1];
+            j++;
+        } else if (!strcasecmp(opt,"state") && remaining) {
+            int jobstate = jobStateFromString(c->argv[j+1]->ptr);
+            if (jobstate == -1) {
+                addReplyError(c,"Invalid job state name");
+                return;
+            }
+            filter.state[jobstate] = 1;
+            filter.numstates++;
+            j++;
+        } else if (!strcasecmp(opt,"reply") && remaining) {
+            if (!strcasecmp(c->argv[j+1]->ptr,"id")) {
+                reply_type = JSCAN_REPLY_ID;
+            } else if (!strcasecmp(c->argv[j+1]->ptr,"all")) {
+                reply_type = JSCAN_REPLY_ALL;
+            } else {
+                addReplyError(c,"Invalid REPLY type, try ID or ALL");
+                return;
+            }
+            j++;
+        } else {
+            if (cursor_set != 0) {
+                addReply(c,shared.syntaxerr);
+                return;
+            }
+            if (parseScanCursorOrReply(c,c->argv[j],&cursor) == DISQUE_ERR)
+                return;
+            cursor_set = 1;
+        }
+    }
+
+    /* Scan the hash table to retrieve elements. */
+    maxiterations = count*10; /* Put a bound in the work we'll do. */
+
+    /* We pass two pointsr to the callback: the list where to append
+     * elements and the filter structure so that the callback will refuse
+     * to add non matching elements. */
+    void *privdata[2];
+    list *list = listCreate();
+    privdata[0] = list;
+    privdata[1] = &filter;
+    do {
+        cursor = dictScan(server.jobs,cursor,jscanCallback,privdata);
+    } while (cursor &&
+             (busyloop || /* If it's a busyloop, don't check iterations & len */
+              (maxiterations-- &&
+               listLength(list) < (unsigned long)count)));
+
+    /* Provide the reply to the client. */
+    addReplyMultiBulkLen(c, 2);
+    addReplyBulkLongLong(c,cursor);
+
+    addReplyMultiBulkLen(c, listLength(list));
+    listNode *node;
+    while ((node = listFirst(list)) != NULL) {
+        job *j = listNodeValue(node);
+        if (reply_type == JSCAN_REPLY_ID) addReplyJobID(c,j);
+        else if (reply_type == JSCAN_REPLY_ALL) addReplyJobInfo(c,j);
+        else serverPanic("Unknown JSCAN reply type");
+        listDelNode(list, node);
+    }
+    listRelease(list);
 }
 
